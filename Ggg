@@ -1,0 +1,93 @@
+import React, { useEffect } from 'react'
+import WebApp from '@twa-dev/sdk'
+import { motion } from 'framer-motion'
+import { ShoppingBag, Zap, Brain, Send, Star, User } from 'lucide-react'
+
+function App() {
+  const myUsername = "ТВОЙ_ЛОГИН"; // ЗАМЕНИ НА СВОЙ ЛОГИН БЕЗ @
+
+  const services = [
+    { 
+      id: 1, title: "🚀 Взрывной CTR", price: "1 000₽", icon: <ShoppingBag />, color: "#FF3366",
+      desc: "Карточки для WB/Ozon, которые ГРАБЯТ внимание. Нейродизайн + маркетинг." 
+    },
+    { 
+      id: 2, title: "🧠 ИИ-Трансформация", price: "3 000₽", icon: <Brain />, color: "#00C2FF",
+      desc: "Внедряю нейросети в ваш бизнес. Хватит тратить часы на то, что ИИ делает за секунды." 
+    },
+    { 
+      id: 3, title: "⚡ Магия Контента", price: "500₽", icon: <Zap />, color: "#AD00FF",
+      desc: "Сценарии и тексты с душой. Идеи, которые заставляют людей подписываться." 
+    }
+  ];
+
+  useEffect(() => {
+    WebApp.ready();
+    WebApp.expand();
+  }, []);
+
+  const handleOrder = (service) => {
+    WebApp.HapticFeedback.impactOccurred('medium');
+    setTimeout(() => WebApp.HapticFeedback.notificationOccurred('success'), 200);
+    const message = `Привет! Хочу заказать услугу: "${service.title}"`;
+    const url = `https://t.me{myUsername}?text=${encodeURIComponent(message)}`;
+    WebApp.openTelegramLink(url);
+  };
+
+  return (
+    <div style={{ background: '#0a0a0a', minHeight: '100vh', color: 'white', padding: '20px', fontFamily: 'sans-serif' }}>
+      
+      {/* 1. ШАПКА */}
+      <motion.header initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} style={{ textAlign: 'center', marginBottom: '30px' }}>
+        <div style={{ 
+          width: '100px', height: '100px', margin: '0 auto 15px', borderRadius: '30px',
+          backgroundImage: 'url("/me.jpg")', backgroundSize: 'cover', border: '2px solid #00C2FF',
+          boxShadow: '0 0 30px rgba(0, 194, 255, 0.2)'
+        }} />
+        <h1 style={{ fontSize: '24px', fontWeight: '900', letterSpacing: '1px' }}>AI EXPERT</h1>
+      </motion.header>
+
+      {/* 2. БЛОК ОБО МНЕ */}
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}
+        style={{ background: 'rgba(255,255,255,0.05)', borderRadius: '20px', padding: '15px', marginBottom: '30px', borderLeft: '4px solid #00C2FF' }}>
+        <p style={{ fontSize: '14px', lineHeight: '1.6', margin: 0, color: '#ccc' }}>
+          Опытный специалист по работе с нейросетями — делюсь практикой и готовыми решениями. 
+          Создаю продающие карточки для маркетплейсов и помогаю внедрять ИИ в повседневные задачи.
+        </p>
+      </motion.div>
+
+      {/* 3. КЕЙСЫ (ГАЛЕРЕЯ) */}
+      <div style={{ marginBottom: '40px' }}>
+        <h3 style={{ fontSize: '18px', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '15px' }}>
+          <Star size={18} color="#FFD700" /> Мои работы
+        </h3>
+        <div style={{ display: 'flex', overflowX: 'auto', gap: '15px', paddingBottom: '10px', scrollbarWidth: 'none' }}>
+          {[1,2,3].map((i) => (
+            <motion.div key={i} onClick={() => WebApp.HapticFeedback.impactOccurred('light')} whileTap={{ scale: 0.9 }} 
+              style={{ minWidth: '140px', height: '190px', borderRadius: '20px', backgroundImage: `url("/work${i}.jpg")`, backgroundSize: 'cover', border: '1px solid rgba(255,255,255,0.1)' }} 
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* 4. УСЛУГИ */}
+      <div style={{ display: 'grid', gap: '15px' }}>
+        {services.map((s) => (
+          <motion.div key={s.id} whileTap={{ scale: 0.97 }} onClick={() => handleOrder(s)}
+            style={{ background: 'rgba(255,255,255,0.03)', borderRadius: '25px', padding: '20px', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', gap: '15px' }}>
+            <div style={{ background: s.color, padding: '12px', borderRadius: '15px' }}>{s.icon}</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: '800', fontSize: '17px', color: s.color }}>{s.title}</div>
+              <div style={{ fontSize: '13px', color: '#888', marginTop: '4px' }}>{s.desc}</div>
+              <div style={{ marginTop: '10px', fontWeight: '900', display: 'flex', justifyContent: 'space-between' }}>
+                {s.price} <Send size={16} opacity={0.5} />
+              </div>
+            </div>
+          </motion.div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default App;
