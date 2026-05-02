@@ -14,8 +14,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ================= CONFIG =================
-TOKEN = "8796786650:AAEnu2bzpqvu3S78upEA3xKk95th3s0xWJA"
-CHAT_ID = "6147800990"
+TOKEN = "8796786650:AAEnu2bzpqvu3S78upEA3xKk95th3s0xW"
+CHAT_ID = "61478009"
 
 ASSETS = {"GOLD": "GC=F", "EURUSD": "EURUSD=X", "BITCOIN": "BTC-USD"}
 FEATURES = ['RSI', 'MACD', 'STOCH_K', 'EMA_9', 'SMA_200', 'ATR']
