@@ -1,0 +1,289 @@
+import yfinance as yf
+import pandas_ta as ta
+import pandas as pd
+import time
+import telebot
+import os
+import joblib
+import mplfinance as mpf
+from sklearn.ensemble import RandomForestClassifier
+from threading import Thread
+from telebot import types
+
+# ================= CONFIG =================
+TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = "6147800990"
+
+ASSETS = {
+    "GOLD": "GC=F",
+    "EURUSD": "EURUSD=X",
+    "BITCOIN": "BTC-USD"
+}
+
+FEATURES = ['Close', 'RSI', 'MACD', 'STOCH_K', 'EMA_9', 'SMA_200', 'Hour', 'DayOfWeek']
+
+TRADE_SIZE = 10
+TP_PCT = 0.002
+SL_PCT = 0.001
+
+MEMORY_FILE = "memory.csv"
+MODEL_FILE = "model.pkl"
+
+balance = 1000.0
+wins, losses = 0, 0
+active_trades = {}
+
+trading_enabled = True
+
+last_train = 0
+TRAIN_INTERVAL = 3600  # 1 hour
+
+bot = telebot.TeleBot(TOKEN)
+
+# ================= UI =================
+def menu():
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    m.row("▶️ Старт", "⛔ Стоп")
+    m.row("💰 Баланс", "📊 Статистика")
+    return m
+
+
+@bot.message_handler(commands=['start'])
+def start(msg):
+    bot.send_message(CHAT_ID, "🚀 PRO SCALPER 2.0 запущен", reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: True)
+def handle(m):
+    global trading_enabled, balance, wins, losses
+
+    if m.text == "▶️ Старт":
+        trading_enabled = True
+        bot.send_message(CHAT_ID, "▶️ Торговля ВКЛ", reply_markup=menu())
+
+    elif m.text == "⛔ Стоп":
+        trading_enabled = False
+        bot.send_message(CHAT_ID, "⛔ Торговля ОСТАНОВЛЕНА", reply_markup=menu())
+
+    elif m.text == "💰 Баланс":
+        bot.send_message(CHAT_ID,
+                         f"💵 Баланс: ${balance:.2f}\n🏆 W: {wins} | ❌ L: {losses}",
+                         reply_markup=menu())
+
+    elif m.text == "📊 Статистика":
+        total = wins + losses
+        wr = (wins / total * 100) if total else 0
+        bot.send_message(CHAT_ID,
+                         f"📊 Сделок: {total}\n"
+                         f"🏆 Winrate: {wr:.1f}%",
+                         reply_markup=menu())
+
+
+Thread(target=bot.infinity_polling).start()
+
+# ================= MODEL =================
+def train_model():
+    if not os.path.exists(MEMORY_FILE):
+        return None
+
+    df = pd.read_csv(MEMORY_FILE).dropna()
+
+    if len(df) < 500:
+        return None
+
+    X = df[FEATURES]
+    y = (df['Close'].shift(-1) > df['Close']).astype(int)
+
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=12,
+        random_state=42
+    )
+
+    model.fit(X[:-1], y[:-1])
+    joblib.dump(model, MODEL_FILE)
+    return model
+
+
+def load_model():
+    if os.path.exists(MODEL_FILE):
+        return joblib.load(MODEL_FILE)
+    return None
+
+
+model = load_model()
+
+# ================= LOOP =================
+while True:
+    for name, ticker in ASSETS.items():
+
+        if not trading_enabled:
+            continue
+
+        try:
+            df = yf.download(ticker, period="2d", interval="1m", progress=False)
+
+            if df.empty:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            # ===== INDICATORS =====
+            df['RSI'] = ta.rsi(df['Close'], 14)
+            df['EMA_9'] = ta.ema(df['Close'], 9)
+            df['SMA_200'] = ta.sma(df['Close'], 200)
+            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], 14)
+
+            macd = ta.macd(df['Close'])
+            stoch = ta.stoch(df['High'], df['Low'], df['Close'])
+
+            if macd is not None:
+                df['MACD'] = macd.iloc[:, 0]
+
+            if stoch is not None:
+                df['STOCH_K'] = stoch.iloc[:, 0]
+
+            df['Hour'] = df.index.hour
+            df['DayOfWeek'] = df.index.dayofweek
+
+            df = df.dropna()
+            if len(df) < 50:
+                continue
+
+            price = df['Close'].iloc[-1]
+
+            # ===== MEMORY (learning) =====
+            if os.path.exists(MEMORY_FILE):
+                old = pd.read_csv(MEMORY_FILE)
+                df_all = pd.concat([old, df])
+            else:
+                df_all = df
+
+            df_all = df_all.dropna()
+            df_all.tail(5000).to_csv(MEMORY_FILE, index=False)
+
+            # ===== TRAIN PERIODICALLY =====
+            if time.time() - last_train > TRAIN_INTERVAL:
+                model = train_model()
+                last_train = time.time()
+
+            # ===== LOAD MODEL =====
+            if model is None:
+                model = load_model()
+
+            # ===== FILTERS =====
+            trend_up = df['EMA_9'].iloc[-1] > df['SMA_200'].iloc[-1]
+            trend_down = not trend_up
+
+            momentum_up = df['MACD'].iloc[-1] > df['MACD'].iloc[-2]
+            momentum_down = not momentum_up
+
+            rsi = df['RSI'].iloc[-1]
+            stoch_k = df['STOCH_K'].iloc[-1]
+
+            pullback_buy = rsi < 40 and stoch_k < 30
+            pullback_sell = rsi > 60 and stoch_k > 70
+
+            atr = df['ATR'].iloc[-1]
+            not_flat = (atr / price) > 0.001
+
+            # ===== ML FILTER =====
+            if model:
+                probs = model.predict_proba(df.iloc[-1:][FEATURES])[0]
+                ai_buy = probs[1] > 0.6
+                ai_sell = probs[0] > 0.6
+            else:
+                ai_buy = ai_sell = True
+
+            # ===== EXIT =====
+            if name in active_trades:
+                t = active_trades[name]
+                close = False
+
+                if t['side'] == "BUY":
+                    if price >= t['tp'] or price <= t['sl']:
+                        close = True
+                else:
+                    if price <= t['tp'] or price >= t['sl']:
+                        close = True
+
+                if time.time() - t['time'] > 300:
+                    close = True
+
+                if close:
+                    if t['side'] == "BUY":
+                        p = ((price - t['entry']) / t['entry']) * TRADE_SIZE
+                    else:
+                        p = ((t['entry'] - price) / t['entry']) * TRADE_SIZE
+
+                    balance += p
+
+                    if p > 0:
+                        wins += 1
+                    else:
+                        losses += 1
+
+                    bot.send_message(CHAT_ID,
+                                     f"{'✅' if p>0 else '❌'} {name} закрыт\n"
+                                     f"P/L: ${p:.3f}\nБаланс: ${balance:.2f}")
+
+                    del active_trades[name]
+
+            # ===== ENTRY =====
+            if name not in active_trades:
+
+                side = None
+
+                if trend_up and momentum_up and pullback_buy and not_flat and ai_buy:
+                    side = "BUY"
+
+                elif trend_down and momentum_down and pullback_sell and not_flat and ai_sell:
+                    side = "SELL"
+
+                if side:
+
+                    if side == "BUY":
+                        tp = price * (1 + TP_PCT)
+                        sl = price * (1 - SL_PCT)
+                    else:
+                        tp = price * (1 - TP_PCT)
+                        sl = price * (1 + SL_PCT)
+
+                    active_trades[name] = {
+                        "entry": price,
+                        "side": side,
+                        "tp": tp,
+                        "sl": sl,
+                        "time": time.time()
+                    }
+
+                    # ===== CHART =====
+                    df_plot = df.tail(50)
+
+                    apds = [
+                        mpf.make_addplot(df_plot['EMA_9'], color='blue'),
+                        mpf.make_addplot(df_plot['SMA_200'], color='red')
+                    ]
+
+                    file = f"{name}_signal.png"
+
+                    mpf.plot(
+                        df_plot,
+                        type='candle',
+                        style='charles',
+                        addplot=apds,
+                        savefig=file
+                    )
+
+                    with open(file, "rb") as f:
+                        bot.send_photo(
+                            CHAT_ID,
+                            f,
+                            caption=f"🔔 {name} {side}\nЦена: {price:.2f}\nTP: {tp:.2f} SL: {sl:.2f}"
+                        )
+
+        except Exception as e:
+            print(f"Ошибка {name}: {e}")
+
+    time.sleep(60)
