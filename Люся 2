@@ -1,0 +1,105 @@
+import yfinance as yf
+import pandas_ta as ta
+import pandas as pd
+import time
+import telebot
+import os
+import joblib
+import mplfinance as mpf
+from sklearn.ensemble import RandomForestClassifier
+from telebot import types
+from threading import Thread
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ================= CONFIG =================
+# СРОЧНО ЗАМЕНИТЕ ТОКЕН В @BotFather, старый уже не безопасен!
+TOKEN = "8796786650:AAEnu2bzpqvu3S78upEA3xKk95th3s0xW"
+CHAT_ID = "61478009"
+
+ASSETS = {"GOLD": "GC=F", "EURUSD": "EURUSD=X", "BITCOIN": "BTC-USD"}
+FEATURES = ['RSI', 'MACD', 'STOCH_K', 'EMA_9', 'SMA_200', 'ATR']
+MODES = {"🐢 Консерватор": 0.85, "⚖️ Умеренный": 0.65, "⚡ Агрессор": 0.55}
+
+# Глобальные переменные
+current_mode = "⚖️ Умеренный"
+balance = 1000.0
+wins, losses = 0, 0
+active_trades = {}
+report_sent = False
+
+MODELS = {a: f"model_{a}.pkl" for a in ASSETS}
+MEMORY = {a: f"mem_{a}.csv" for a in ASSETS}
+
+bot = telebot.TeleBot(TOKEN)
+
+# ================= UI & BUTTONS =================
+def main_menu():
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    m.row("🐢 Консерватор", "⚖️ Умеренный", "⚡ Агрессор")
+    m.row("💰 Баланс", "📊 Статус")
+    return m
+
+@bot.message_handler(commands=['start'])
+def start(msg):
+    bot.send_message(msg.chat.id, "🚀 PRO SCALPER 5.0 запущен!", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda m: m.text in MODES)
+def change_mode(m):
+    global current_mode
+    current_mode = m.text
+    bot.send_message(m.chat.id, f"✅ Режим изменен на: {current_mode}")
+
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def show_balance(m):
+    bot.send_message(m.chat.id, f"💵 Баланс: ${balance:.2f}\n✅ Wins: {wins} | ❌ Losses: {losses}")
+
+@bot.message_handler(func=lambda m: m.text == "📊 Статус")
+def show_status(m):
+    s_msg = f"⚙️ Режим: {current_mode}\n"
+    for a in ASSETS:
+        cnt = len(pd.read_csv(MEMORY[a])) if os.path.exists(MEMORY[a]) else 0
+        s_msg += f"📦 {a}: {cnt} паттернов в базе\n"
+    bot.send_message(m.chat.id, s_msg)
+
+# ================= ML & TRADE LOGIC =================
+def train_model(asset):
+    if not os.path.exists(MEMORY[asset]): return None
+    df = pd.read_csv(MEMORY[asset]).dropna()
+    if len(df) < 50: return None
+    X, y = df[FEATURES], df['result']
+    model = RandomForestClassifier(n_estimators=150, max_depth=10, random_state=42)
+    model.fit(X, y)
+    joblib.dump(model, MODELS[asset])
+    return model
+
+def trading_engine():
+    global balance, wins, losses, report_sent
+    print("📡 ИИ-Трейдер запущен в фоновом потоке...")
+    
+    while True:
+        try:
+            threshold = MODES[current_mode]
+            # Логика трейдинга (весь ваш цикл из while True)
+            # ... (здесь ваш код анализа рынка и открытия сделок) ...
+            
+            # Пример обработки активов (сокращенно для структуры)
+            for name, ticker in ASSETS.items():
+                # [Ваш блок с yf.download и индикаторами]
+                pass
+                
+            time.sleep(300) # Интервал 5 минут
+        except Exception as e:
+            print(f"Ошибка в движке: {e}")
+            time.sleep(60)
+
+# ================= RUN =================
+if __name__ == "__main__":
+    # 1. Запускаем торговый движок в ФОНЕ
+    trade_thread = Thread(target=trading_engine, daemon=True)
+    trade_thread.start()
+
+    # 2. Запускаем бота в ОСНОВНОМ ПОТОКЕ
+    print("🤖 Бот активен...")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
