@@ -1,0 +1,247 @@
+import yfinance as yf
+import pandas_ta as ta
+import pandas as pd
+import time
+import telebot
+import os
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from telebot import types
+from threading import Thread
+from datetime import datetime
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ================= CONFIG =================
+TOKEN = "PUT_YOUR_TOKEN"
+CHAT_ID = "PUT_CHAT_ID"
+
+ASSETS = {
+    "GOLD": "GC=F",
+    "EURUSD": "EURUSD=X",
+    "BITCOIN": "BTC-USD"
+}
+
+FEATURES = ['RSI', 'MACD', 'STOCH_K', 'EMA_9', 'SMA_200', 'ATR']
+
+MODES = {
+    "🐢 Консерватор": 0.85,
+    "⚖️ Умеренный": 0.65,
+    "⚡ Агрессор": 0.55
+}
+
+FEE = 0.001
+SLIPPAGE = 0.0005
+RISK = 0.02
+
+current_mode = "⚖️ Умеренный"
+selected_asset = None
+
+balance = 1000.0
+wins, losses = 0, 0
+active_trades = {}
+
+bot = telebot.TeleBot(TOKEN)
+
+# ================= UI =================
+def menu():
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+
+    m.row("🥇 GOLD", "💶 EURUSD", "₿ BITCOIN")
+    m.row("🐢 Консерватор", "⚖️ Умеренный", "⚡ Агрессор")
+    m.row("📊 Позиции", "💰 Баланс")
+    m.row("📈 График", "🛑 Close All")
+
+    return m
+
+
+@bot.message_handler(commands=['start'])
+def start(m):
+    bot.send_message(m.chat.id, "🚀 AI TRADING TERMINAL", reply_markup=menu())
+
+
+# ================= MODE =================
+@bot.message_handler(func=lambda m: m.text in MODES)
+def set_mode(m):
+    global current_mode
+    current_mode = m.text
+    bot.send_message(m.chat.id, f"Mode: {current_mode}")
+
+
+# ================= ASSET =================
+@bot.message_handler(func=lambda m: m.text in ["🥇 GOLD", "💶 EURUSD", "₿ BITCOIN"])
+def select_asset(m):
+    global selected_asset
+
+    mapping = {
+        "🥇 GOLD": "GOLD",
+        "💶 EURUSD": "EURUSD",
+        "₿ BITCOIN": "BITCOIN"
+    }
+
+    selected_asset = mapping[m.text]
+    bot.send_message(m.chat.id, f"📌 Selected: {selected_asset}")
+
+
+# ================= BALANCE =================
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def bal(m):
+    bot.send_message(m.chat.id, f"Balance: {balance:.2f}\nW:{wins} L:{losses}")
+
+
+# ================= POSITIONS =================
+@bot.message_handler(func=lambda m: m.text == "📊 Позиции")
+def pos(m):
+    if not active_trades:
+        bot.send_message(m.chat.id, "No trades")
+        return
+
+    msg = "TRADES:\n\n"
+    for k, v in active_trades.items():
+        msg += f"{k} {v['side']}\n{v['entry']:.2f}\nTP {v['tp']:.2f} SL {v['sl']:.2f}\n\n"
+
+    bot.send_message(m.chat.id, msg)
+
+
+# ================= CLOSE ALL =================
+@bot.message_handler(func=lambda m: m.text == "🛑 Close All")
+def close_all(m):
+    global active_trades
+    active_trades = {}
+    bot.send_message(m.chat.id, "All closed")
+
+
+# ================= CHART FUNCTION =================
+def send_trade_chart(chat_id, df, entry, tp, sl, side):
+    plt.figure(figsize=(10,5))
+
+    plt.plot(df['Close'], label="Price")
+
+    idx = len(df) - 1
+
+    color = "green" if side == "BUY" else "red"
+    plt.scatter(idx, entry, color=color, s=120, label="ENTRY")
+
+    plt.axhline(tp, linestyle="--", color="green", alpha=0.6, label="TP")
+    plt.axhline(sl, linestyle="--", color="red", alpha=0.6, label="SL")
+
+    plt.title(f"Trade {side}")
+    plt.legend()
+
+    path = "trade.png"
+    plt.savefig(path)
+    plt.close()
+
+    bot.send_photo(chat_id, open(path, "rb"))
+
+
+# ================= ML =================
+def load_model(a):
+    path = f"model_{a}.pkl"
+    if os.path.exists(path):
+        return joblib.load(path)
+    return None
+
+
+# ================= ENGINE =================
+def engine():
+    global balance, wins, losses
+
+    while True:
+        try:
+            threshold = MODES[current_mode]
+
+            for name, ticker in ASSETS.items():
+
+                if selected_asset and name != selected_asset:
+                    continue
+
+                df = yf.download(ticker, period="3d", interval="5m")
+
+                if df.empty:
+                    continue
+
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+
+                df['RSI'] = ta.rsi(df['Close'])
+                df['EMA_9'] = ta.ema(df['Close'], 9)
+                df['SMA_200'] = ta.sma(df['Close'], 200)
+                df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'])
+
+                macd = ta.macd(df['Close'])
+                stoch = ta.stoch(df['High'], df['Low'], df['Close'])
+
+                df['MACD'] = macd.iloc[:, 0]
+                df['STOCH_K'] = stoch.iloc[:, 0]
+
+                df = df.dropna()
+
+                price = df['Close'].iloc[-1]
+                atr = df['ATR'].iloc[-1]
+
+                model = load_model(name)
+                if model is None:
+                    continue
+
+                X = df.iloc[-1][FEATURES].values.reshape(1, -1)
+                proba = model.predict_proba(X)[0][1]
+
+                if proba > threshold:
+                    side = "BUY"
+                elif proba < (1 - threshold):
+                    side = "SELL"
+                else:
+                    continue
+
+                if side == "BUY":
+                    tp = price + atr * 1.5
+                    sl = price - atr
+                else:
+                    tp = price - atr * 1.5
+                    sl = price + atr
+
+                # ===== OPEN TRADE =====
+                active_trades[name] = {
+                    "entry": price,
+                    "side": side,
+                    "tp": tp,
+                    "sl": sl,
+                    "time": time.time()
+                }
+
+                bot.send_message(CHAT_ID, f"{name} {side}")
+
+                # ================= TRADE CHART =================
+                try:
+                    df_chart = yf.download(ticker, period="1d", interval="15m")
+
+                    if isinstance(df_chart.columns, pd.MultiIndex):
+                        df_chart.columns = df_chart.columns.get_level_values(0)
+
+                    send_trade_chart(
+                        CHAT_ID,
+                        df_chart,
+                        price,
+                        tp,
+                        sl,
+                        side
+                    )
+
+                except Exception as e:
+                    print("chart error:", e)
+
+        except Exception as e:
+            print("ERROR:", e)
+
+        time.sleep(300)
+
+
+# ================= START =================
+if __name__ == "__main__":
+    Thread(target=engine, daemon=True).start()
+
+    print("BOT RUNNING")
+    bot.infinity_polling(skip_pending=True)
