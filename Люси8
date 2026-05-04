@@ -1,0 +1,250 @@
+import MetaTrader5 as mt5
+import telebot
+import time
+import pandas as pd
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
+from threading import Thread
+from sklearn.ensemble import RandomForestClassifier
+
+# ================= CONFIG =================
+TOKEN = "PUT_TOKEN"
+CHAT_ID = "PUT_CHAT_ID"
+
+ACCOUNT = 12345678
+PASSWORD = "PASSWORD"
+SERVER = "BROKER"
+
+SYMBOLS = {
+    "GOLD": "XAUUSD",
+    "EURUSD": "EURUSD"
+}
+
+LOT = 0.01
+
+MEMORY_FILE = "trades.csv"
+EQUITY_FILE = "equity.csv"
+MODEL_FILE = "model.pkl"
+
+DAY_START_BALANCE = None
+bot = telebot.TeleBot(TOKEN)
+
+# ================= MT5 CONNECT =================
+def connect():
+    mt5.initialize()
+    mt5.login(ACCOUNT, PASSWORD, SERVER)
+
+# ================= UI =================
+def menu():
+    m = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    m.row("🥇 GOLD", "💶 EURUSD")
+    m.row("🐢 Консерватор", "⚖️ Умеренный", "⚡ Агрессор")
+    m.row("📊 Позиции", "💰 Баланс")
+    return m
+
+selected_asset = None
+
+@bot.message_handler(commands=['start'])
+def start(m):
+    bot.send_message(m.chat.id, "🚀 MT5 AI BOT", reply_markup=menu())
+
+@bot.message_handler(func=lambda m: m.text in ["🥇 GOLD", "💶 EURUSD"])
+def select(m):
+    global selected_asset
+    selected_asset = SYMBOLS["GOLD"] if "GOLD" in m.text else SYMBOLS["EURUSD"]
+    bot.send_message(m.chat.id, f"Selected: {selected_asset}")
+
+# ================= DATA =================
+def get_data(symbol):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 200)
+    df = pd.DataFrame(rates)
+
+    df['RSI'] = ta.rsi(df['close'])
+    df['EMA'] = ta.ema(df['close'], 9)
+    df['SMA'] = ta.sma(df['close'], 50)
+    df['ATR'] = ta.atr(df['high'], df['low'], df['close'])
+
+    df = df.dropna()
+    return df
+
+# ================= AI REASON =================
+def explain(df, side, atr):
+    rsi = df['RSI'].iloc[-1]
+    ema = df['EMA'].iloc[-1]
+    sma = df['SMA'].iloc[-1]
+
+    trend = "UP" if ema > sma else "DOWN"
+
+    text = [
+        f"RSI: {rsi:.1f}",
+        f"Trend: {trend}",
+        f"ATR: {atr:.5f}",
+        f"Signal: {side}"
+    ]
+
+    return "\n".join(text)
+
+# ================= MEMORY =================
+def save_trade(symbol, side, entry, exit_price):
+    profit = (exit_price - entry) if side == "BUY" else (entry - exit_price)
+    win = 1 if profit > 0 else 0
+
+    df = pd.DataFrame([{
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "exit": exit_price,
+        "profit": profit,
+        "result": win
+    }])
+
+    df.to_csv(MEMORY_FILE, mode="a", header=not os.path.exists(MEMORY_FILE), index=False)
+
+# ================= MODEL =================
+def train():
+    if not os.path.exists(MEMORY_FILE):
+        return None
+
+    df = pd.read_csv(MEMORY_FILE)
+
+    if len(df) < 30:
+        return None
+
+    X = df[["profit"]]
+    y = df["result"]
+
+    model = RandomForestClassifier(n_estimators=100)
+    model.fit(X, y)
+    return model
+
+# ================= EQUITY =================
+def save_equity(balance):
+    df = pd.DataFrame([{
+        "time": datetime.now(),
+        "balance": balance
+    }])
+
+    df.to_csv(EQUITY_FILE, mode="a", header=not os.path.exists(EQUITY_FILE), index=False)
+
+def chart():
+    if not os.path.exists(EQUITY_FILE):
+        return
+
+    df = pd.read_csv(EQUITY_FILE)
+
+    plt.figure()
+    plt.plot(df["balance"])
+    plt.title("Equity Curve")
+
+    path = "equity.png"
+    plt.savefig(path)
+    plt.close()
+
+    bot.send_photo(CHAT_ID, open(path, "rb"))
+
+# ================= TRADE =================
+def open_trade(symbol, side, atr, df):
+    tick = mt5.symbol_info_tick(symbol)
+
+    price = tick.ask if side == "BUY" else tick.bid
+
+    tp = price + atr * 1.5 if side == "BUY" else price - atr * 1.5
+    sl = price - atr if side == "BUY" else price + atr
+
+    reason = explain(df, side, atr)
+
+    order = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": LOT,
+        "type": mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "deviation": 10,
+        "magic": 123456,
+        "comment": "AI BOT",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(order)
+
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        bot.send_message(CHAT_ID, f"🚀 OPEN {symbol}\n{side}\n\n📊 REASON:\n{reason}")
+
+    return price, side
+
+# ================= ENGINE =================
+def engine():
+    global DAY_START_BALANCE
+
+    connect()
+
+    acc = mt5.account_info()
+    DAY_START_BALANCE = acc.balance
+
+    while True:
+        try:
+            for name, symbol in SYMBOLS.items():
+
+                if selected_asset and symbol != selected_asset:
+                    continue
+
+                df = get_data(symbol)
+                if df.empty:
+                    continue
+
+                atr = df['ATR'].iloc[-1]
+                rsi = df['RSI'].iloc[-1]
+
+                if rsi < 30:
+                    side = "BUY"
+                elif rsi > 70:
+                    side = "SELL"
+                else:
+                    continue
+
+                open_trade(symbol, side, atr, df)
+                save_equity(mt5.account_info().balance)
+
+        except Exception as e:
+            print(e)
+
+        time.sleep(300)
+
+# ================= DAILY REPORT =================
+def report():
+    while True:
+        now = datetime.now()
+
+        if now.hour == 23 and now.minute == 59:
+
+            acc = mt5.account_info()
+
+            df = pd.read_csv(MEMORY_FILE) if os.path.exists(MEMORY_FILE) else pd.DataFrame()
+
+            winrate = (df["result"].mean() * 100) if not df.empty else 0
+
+            pnl = acc.balance - DAY_START_BALANCE
+
+            msg = (
+                f"📊 DAILY REPORT\n\n"
+                f"💰 Balance: {acc.balance:.2f}\n"
+                f"📈 PnL: {pnl:.2f}\n"
+                f"🎯 Winrate: {winrate:.1f}%"
+            )
+
+            bot.send_message(CHAT_ID, msg)
+            chart()
+
+            time.sleep(60)
+
+# ================= START =================
+if __name__ == "__main__":
+    Thread(target=engine, daemon=True).start()
+    Thread(target=report, daemon=True).start()
+
+    bot.infinity_polling()
