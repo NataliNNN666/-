@@ -1,0 +1,166 @@
+import MetaTrader5 as mt5
+import telebot
+import pandas as pd
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import os
+import time
+from datetime import datetime
+from threading import Thread
+
+# ================= CONFIG =================
+TOKEN = "ВАШ_ТОКЕН"
+CHAT_ID = "ВАШ_ID"
+ACCOUNT = 12345678
+PASSWORD = "PASSWORD"
+SERVER = "Broker-Server"
+
+SYMBOLS = {"GOLD": "XAUUSD", "EURUSD": "EURUSD"}
+LOT = 0.01
+MAGIC = 123456
+
+bot = telebot.TeleBot(TOKEN)
+
+# ================= АНАЛИТИКА И ГРАФИКИ =================
+
+def save_chart_snapshot(symbol, side, price):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 50)
+    if rates is None: return None
+    df = pd.DataFrame(rates)
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['close'], label='Цена (Close)', color='blue')
+    color = 'green' if side == "BUY" else 'red'
+    plt.axhline(y=price, color=color, linestyle='--', label=f'Вход {side}')
+    plt.title(f"Сделка по {symbol} | Цена: {price}")
+    plt.legend()
+    
+    img_path = f"entry_{symbol}.png"
+    plt.savefig(img_path)
+    plt.close()
+    return img_path
+
+def get_reasoning(symbol, df):
+    rsi = df['RSI'].iloc[-1]
+    atr = df['ATR'].iloc[-1]
+    return (f"📊 **АНАЛИЗ СИГНАЛА {symbol}**\n"
+            f"• RSI: {rsi:.2f} ({'НИЗКИЙ' if rsi < 30 else 'ВЫСОКИЙ'})\n"
+            f"• ATR (Волатильность): {atr:.5f}\n"
+            f"• Решение: Вход на отскок от зоны экстремума.")
+
+# ================= ТОРГОВЛЯ =================
+
+def open_trade(symbol, side, df):
+    tick = mt5.symbol_info_tick(symbol)
+    price = tick.ask if side == "BUY" else tick.bid
+    atr = df['ATR'].iloc[-1]
+    sl = price - (atr * 2.5) if side == "BUY" else price + (atr * 2.5)
+    tp = price + (atr * 4) if side == "BUY" else price - (atr * 4)
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": LOT,
+        "type": mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "magic": MAGIC,
+        "comment": "AI_EVOLVED",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        # Отправка данных в Telegram
+        bot.send_message(CHAT_ID, get_reasoning(symbol, df), parse_mode="Markdown")
+        img = save_chart_snapshot(symbol, side, price)
+        if img:
+            with open(img, 'rb') as photo:
+                bot.send_photo(CHAT_ID, photo, caption=f"✅ Открыт {side}")
+        
+        # Запись в память
+        log_to_csv(symbol, side, df.iloc[-1])
+    return result
+
+def log_to_csv(symbol, side, row):
+    log_file = "trading_memory.csv"
+    data = {"time": datetime.now(), "symbol": symbol, "side": side, "rsi": row['RSI'], "atr": row['ATR']}
+    pd.DataFrame([data]).to_csv(log_file, mode='a', header=not os.path.exists(log_file), index=False)
+
+# ================= ИНТЕРФЕЙС ТЕЛЕГРАМ =================
+
+def main_menu():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📊 Позиции", "💰 Баланс")
+    markup.row("🥇 GOLD", "💶 EURUSD")
+    markup.row("⚠️ ЗАКРЫТЬ ВСЁ")
+    return markup
+
+@bot.message_handler(commands=['start'])
+def start(m):
+    bot.send_message(m.chat.id, "🤖 Бот-аналитик запущен.", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def show_balance(m):
+    acc = mt5.account_info()
+    bot.send_message(m.chat.id, f"💳 Баланс: {acc.balance} {acc.currency}\n📈 Эквити: {acc.equity}")
+
+@bot.message_handler(func=lambda m: m.text == "📊 Позиции")
+def show_positions(m):
+    pos = mt5.positions_get()
+    if not pos:
+        bot.send_message(m.chat.id, "Активных сделок нет.")
+        return
+    res = "🔍 Текущие сделки:\n"
+    for p in pos:
+        res += f"\n{p.symbol} {'BUY' if p.type==0 else 'SELL'} | Profit: {p.profit:.2f}"
+    bot.send_message(m.chat.id, res)
+
+@bot.message_handler(func=lambda m: m.text == "⚠️ ЗАКРЫТЬ ВСЁ")
+def close_all(m):
+    positions = mt5.positions_get()
+    for p in positions:
+        tick = mt5.symbol_info_tick(p.symbol)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": p.symbol,
+            "volume": p.volume,
+            "type": mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY,
+            "position": p.ticket,
+            "price": tick.bid if p.type == 0 else tick.ask,
+            "magic": MAGIC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        mt5.order_send(request)
+    bot.send_message(m.chat.id, "🛑 Все сделки закрыты.")
+
+# ================= ДВИЖОК =================
+
+def trading_engine():
+    mt5.initialize()
+    mt5.login(ACCOUNT, PASSWORD, SERVER)
+    while True:
+        try:
+            for _, symbol in SYMBOLS.items():
+                if mt5.positions_get(symbol=symbol): continue
+                
+                rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 100)
+                if rates is None: continue
+                
+                df = pd.DataFrame(rates)
+                df['RSI'] = ta.rsi(df['close'], length=14)
+                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                df.dropna(inplace=True)
+                
+                rsi = df['RSI'].iloc[-1]
+                if rsi < 28: open_trade(symbol, "BUY", df)
+                elif rsi > 72: open_trade(symbol, "SELL", df)
+        except Exception as e:
+            print(f"Ошибка движка: {e}")
+        time.sleep(60)
+
+if __name__ == "__main__":
+    Thread(target=trading_engine, daemon=True).start()
+    bot.infinity_polling()
