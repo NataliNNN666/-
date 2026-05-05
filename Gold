@@ -1,0 +1,212 @@
+import MetaTrader5 as mt5
+import telebot
+import pandas as pd
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import os
+import time
+from datetime import datetime
+from threading import Thread
+
+# ================= CONFIG (ВСТАВЬТЕ СВОИ ДАННЫЕ) =================
+TOKEN = "ВАШ_ТОКЕН_ИЗ_BOTFATHER"
+CHAT_ID = "ВАШ_ID_ИЗ_USERINFOBOT"
+ACCOUNT = 12345678
+PASSWORD = "ВАШ_ПАРОЛЬ"
+SERVER = "ВАШ_СЕРВЕР_БРОКЕРА"
+
+SYMBOLS = {"GOLD": "XAUUSD", "EURUSD": "EURUSD"} # Проверьте названия в MT5
+LOT = 0.01
+MAGIC = 123456
+LOG_FILE = "trading_memory.csv"
+
+bot = telebot.TeleBot(TOKEN)
+
+# ================= АНАЛИТИКА И ГРАФИКИ =================
+
+def save_chart_snapshot(symbol, side, price):
+    """Рисует график 5-минуток и отмечает вход"""
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 50)
+    if rates is None: return None
+    df = pd.DataFrame(rates)
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['close'], label='Цена (Close)', color='blue', linewidth=1.5)
+    color = 'green' if side == "BUY" else 'red'
+    plt.axhline(y=price, color=color, linestyle='--', label=f'Вход {side}')
+    plt.title(f"Сделка по {symbol} | Цена: {price} | {datetime.now().strftime('%H:%M')}")
+    plt.legend()
+    
+    img_path = f"entry_{symbol}.png"
+    plt.savefig(img_path)
+    plt.close()
+    return img_path
+
+def get_reasoning(symbol, df):
+    """Текстовое обоснование входа"""
+    rsi = df['RSI'].iloc[-1]
+    atr = df['ATR'].iloc[-1]
+    condition = "Перепроданность (BUY)" if rsi < 30 else "Перекупленность (SELL)"
+    return (f"📊 **АНАЛИЗ СИГНАЛА: {symbol}**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"• **Индикатор RSI:** {rsi:.2f}\n"
+            f"• **Статус:** {condition}\n"
+            f"• **Волатильность (ATR):** {atr:.5f}\n"
+            f"• **Действие:** Открываю ордер по рынку.")
+
+# ================= ТОРГОВЛЯ =================
+
+def open_trade(symbol, side, df):
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick: return
+    
+    price = tick.ask if side == "BUY" else tick.bid
+    atr = df['ATR'].iloc[-1]
+    
+    # Динамический SL и TP на основе волатильности (ATR)
+    sl = price - (atr * 3) if side == "BUY" else price + (atr * 3)
+    tp = price + (atr * 5) if side == "BUY" else price - (atr * 5)
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": LOT,
+        "type": mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "magic": MAGIC,
+        "comment": "AI_BOT_V3",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        # Отправляем отчет и график в Telegram
+        bot.send_message(CHAT_ID, get_reasoning(symbol, df), parse_mode="Markdown")
+        img = save_chart_snapshot(symbol, side, price)
+        if img:
+            with open(img, 'rb') as photo:
+                bot.send_photo(CHAT_ID, photo, caption=f"✅ Ордер {side} исполнен")
+        
+        # Запоминаем сделку для анализа
+        log_to_csv(symbol, side, df.iloc[-1])
+    return result
+
+def log_to_csv(symbol, side, row):
+    data = {"time": datetime.now(), "symbol": symbol, "side": side, "rsi": row['RSI'], "atr": row['ATR']}
+    pd.DataFrame([data]).to_csv(LOG_FILE, mode='a', header=not os.path.exists(LOG_FILE), index=False)
+
+# ================= ОТЧЕТНОСТЬ =================
+
+def send_daily_report():
+    now = datetime.now()
+    start_of_day = datetime(now.year, now.month, now.day)
+    history = mt5.history_deals_get(start_of_day, now)
+    
+    if not history:
+        bot.send_message(CHAT_ID, "📊 **Итоги дня:** Сделок не зафиксировано.")
+        return
+
+    profit, wins, losses = 0, 0, 0
+    for deal in history:
+        if deal.entry == mt5.DEAL_ENTRY_OUT: # Считаем только закрытые сделки
+            p = deal.profit + deal.commission + deal.swap
+            profit += p
+            if p > 0: wins += 1
+            else: losses += 1
+
+    msg = (f"🏁 **ИТОГИ ДНЯ {now.strftime('%d.%m.%y')}**\n"
+           f"━━━━━━━━━━━━━━━━━━\n"
+           f"💰 Профит: **{profit:.2f}$**\n"
+           f"✅ Плюсы: {wins} | ❌ Минусы: {losses}\n"
+           f"🎯 Точность: {(wins/(wins+losses)*100 if wins+losses > 0 else 0):.1f}%")
+    bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+
+# ================= ИНТЕРФЕЙС ТЕЛЕГРАМ =================
+
+def main_menu():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📊 Позиции", "💰 Баланс")
+    markup.row("🥇 GOLD", "💶 EURUSD")
+    markup.row("⚠️ ЗАКРЫТЬ ВСЕ")
+    return markup
+
+@bot.message_handler(commands=['start'])
+def start(m):
+    bot.send_message(m.chat.id, "🤖 Бот-аналитик MT5 готов.", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def show_balance(m):
+    acc = mt5.account_info()
+    bot.send_message(m.chat.id, f"💳 Баланс: {acc.balance} {acc.currency}\n📈 Эквити: {acc.equity}")
+
+@bot.message_handler(func=lambda m: m.text == "📊 Позиции")
+def show_positions(m):
+    pos = mt5.positions_get()
+    if not pos:
+        bot.send_message(m.chat.id, "Нет активных сделок.")
+        return
+    res = "🔍 Текущие позиции:\n"
+    for p in pos:
+        res += f"\n{p.symbol} {'BUY' if p.type==0 else 'SELL'} | Profit: {p.profit:.2f}$"
+    bot.send_message(m.chat.id, res)
+
+@bot.message_handler(func=lambda m: m.text == "⚠️ ЗАКРЫТЬ ВСЕ")
+def close_everything(m):
+    positions = mt5.positions_get()
+    for p in positions:
+        tick = mt5.symbol_info_tick(p.symbol)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": p.symbol,
+            "volume": p.volume,
+            "type": mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY,
+            "position": p.ticket,
+            "price": tick.bid if p.type == 0 else tick.ask,
+            "magic": MAGIC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        mt5.order_send(request)
+    bot.send_message(m.chat.id, "🛑 Все позиции принудительно закрыты.")
+
+# ================= ДВИЖОК ТОРГОВЛИ И ПЛАНИРОВЩИК =================
+
+def trading_engine():
+    mt5.initialize()
+    mt5.login(ACCOUNT, PASSWORD, SERVER)
+    while True:
+        try:
+            for _, symbol in SYMBOLS.items():
+                if mt5.positions_get(symbol=symbol): continue # Защита от дублей
+                
+                rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 100)
+                if rates is None: continue
+                
+                df = pd.DataFrame(rates)
+                df['RSI'] = ta.rsi(df['close'], length=14)
+                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                df.dropna(inplace=True)
+                
+                rsi = df['RSI'].iloc[-1]
+                if rsi < 28: open_trade(symbol, "BUY", df)
+                elif rsi > 72: open_trade(symbol, "SELL", df)
+        except Exception as e:
+            print(f"Engine Error: {e}")
+        time.sleep(60)
+
+def report_scheduler():
+    while True:
+        now = datetime.now()
+        if now.hour == 23 and now.minute == 55:
+            send_daily_report()
+            time.sleep(65)
+        time.sleep(30)
+
+# ================= RUN =================
+if __name__ == "__main__":
+    print("Бот запущен. Ожидаю сигналов...")
+    Thread(target=trading_engine, daemon=True).start()
+    Thread(target=report_scheduler, daemon=True).start()
+    bot.infinity_polling()
