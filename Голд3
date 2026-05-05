@@ -1,0 +1,206 @@
+import MetaTrader5 as mt5
+import telebot
+import pandas as pd
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import os
+import time
+from datetime import datetime, timedelta
+from threading import Thread
+
+# ================= CONFIG =================
+TOKEN = "ВАШ_ТОКЕН"
+CHAT_ID = "ВАШ_ID"
+ACCOUNT = 68313049
+PASSWORD = "ВАШ_ПАРОЛЬ"
+SERVER = "RoboForex-Pro"
+
+SYMBOLS = {"GOLD": "XAUUSD", "EURUSD": "EURUSD"}
+LOT = 0.01
+MAGIC = 123456
+LOG_FILE = "trading_memory.csv"
+
+# Состояния: 0 - Отключен, 1 - Только сигналы, 2 - Автоторговля
+trading_mode = 2 
+MODES = {0: "🔴 Отключен", 1: "🔍 Только Сигналы", 2: "🤖 Автоторговля"}
+
+bot = telebot.TeleBot(TOKEN)
+
+# ================= СИСТЕМА ПАМЯТИ И АНАЛИЗА =================
+
+def log_entry(symbol, side, row, ticket):
+    data = {
+        "ticket": ticket,
+        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "symbol": symbol,
+        "side": side,
+        "rsi": round(row['RSI'], 2),
+        "atr": round(row['ATR'], 5),
+        "profit": "OPEN"
+    }
+    df = pd.DataFrame([data])
+    df.to_csv(LOG_FILE, mode='a', header=not os.path.exists(LOG_FILE), index=False)
+
+def sync_results_worker():
+    while True:
+        try:
+            if os.path.exists(LOG_FILE):
+                df = pd.read_csv(LOG_FILE)
+                open_idx = df[df['profit'] == "OPEN"].index
+                if not open_idx.empty:
+                    from_date = datetime.now() - timedelta(days=3)
+                    history = mt5.history_deals_get(from_date, datetime.now())
+                    if history:
+                        for idx in open_idx:
+                            ticket = int(df.at[idx, 'ticket'])
+                            for deal in history:
+                                if deal.position_id == ticket and deal.entry == mt5.DEAL_ENTRY_OUT:
+                                    res = deal.profit + deal.commission + deal.swap
+                                    df.at[idx, 'profit'] = round(res, 2)
+                        df.to_csv(LOG_FILE, index=False)
+        except Exception as e: print(f"Ошибка аналитика: {e}")
+        time.sleep(300)
+
+# ================= ВИЗУАЛИЗАЦИЯ И ОТЧЕТЫ =================
+
+def send_chart(symbol, side, price, rsi):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 60)
+    if rates is None: return
+    df = pd.DataFrame(rates)
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['close'], label='Цена', color='blue')
+    plt.axhline(y=price, color=('green' if side == "BUY" else 'red'), linestyle='--', label='Вход')
+    plt.title(f"{symbol} | {side} | RSI: {rsi:.2f}")
+    plt.legend()
+    path = f"chart_{symbol}_{int(time.time())}.png"
+    plt.savefig(path)
+    plt.close()
+    with open(path, 'rb') as f:
+        bot.send_photo(CHAT_ID, f, caption=f"🚀 Сделка открыта: {side} по {price}")
+    if os.path.exists(path): os.remove(path)
+
+# ================= ТОРГОВЫЙ ДВИЖОК =================
+
+def open_trade(symbol, side, df):
+    tick = mt5.symbol_info_tick(symbol)
+    price = tick.ask if side == "BUY" else tick.bid
+    atr = df['ATR'].iloc[-1]
+    sl = price - (atr * 3) if side == "BUY" else price + (atr * 3)
+    tp = price + (atr * 5) if side == "BUY" else price - (atr * 5)
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": LOT,
+        "type": mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price, "sl": sl, "tp": tp,
+        "magic": MAGIC, "comment": "AI_EVOLVE",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(request)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        send_chart(symbol, side, price, df['RSI'].iloc[-1])
+        log_entry(symbol, side, df.iloc[-1], result.order)
+
+def trading_engine():
+    if not mt5.initialize(): return
+    mt5.login(ACCOUNT, PASSWORD, SERVER)
+    while True:
+        if trading_mode == 0: 
+            time.sleep(10)
+            continue
+        try:
+            for _, symbol in SYMBOLS.items():
+                if mt5.positions_get(symbol=symbol): continue
+                rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 100)
+                if rates is None: continue
+                df = pd.DataFrame(rates)
+                df['RSI'] = ta.rsi(df['close'], length=14)
+                df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                df.dropna(inplace=True)
+                
+                rsi = df['RSI'].iloc[-1]
+                side = "BUY" if rsi < 28 else "SELL" if rsi > 72 else None
+                
+                if side:
+                    if trading_mode == 2: open_trade(symbol, side, df)
+                    elif trading_mode == 1:
+                        bot.send_message(CHAT_ID, f"🔍 СИГНАЛ: {symbol} -> {side}\nRSI: {rsi:.2f}")
+        except Exception as e: print(f"Engine Error: {e}")
+        time.sleep(60)
+
+# ================= ИНТЕРФЕЙС ТЕЛЕГРАМ =================
+
+def get_main_kb():
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📊 Позиции", "💰 Баланс")
+    kb.row("⚙️ Режим", "📈 Статистика")
+    kb.row("⚠️ ЗАКРЫТЬ ВСЕ")
+    return kb
+
+@bot.message_handler(commands=['start'])
+def welcome(m):
+    bot.send_message(m.chat.id, f"🤖 ИИ-Трейдер активен\nРежим: {MODES[trading_mode]}", reply_markup=get_main_kb())
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ Режим")
+def change_mode(m):
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.add(telebot.types.InlineKeyboardButton("🔴 Выключить", callback_data="set_m_0"))
+    kb.add(telebot.types.InlineKeyboardButton("🔍 Только Сигналы", callback_data="set_m_1"))
+    kb.add(telebot.types.InlineKeyboardButton("🤖 Автоторговля", callback_data="set_m_2"))
+    bot.send_message(m.chat.id, "Выберите режим работы:", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("set_m_"))
+def update_mode(call):
+    global trading_mode
+    trading_mode = int(call.data.split("_")[-1])
+    bot.edit_message_text(f"✅ Режим изменен на: {MODES[trading_mode]}", call.message.chat.id, call.message.message_id)
+
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def balance(m):
+    acc = mt5.account_info()
+    if acc: bot.send_message(m.chat.id, f"💳 Баланс: {acc.balance}$\n📈 Средства: {acc.equity}$")
+
+@bot.message_handler(func=lambda m: m.text == "📊 Позиции")
+def positions(m):
+    pos = mt5.positions_get()
+    if not pos:
+        bot.send_message(m.chat.id, "Нет активных сделок.")
+        return
+    res = "🔍 ТЕКУЩИЕ СДЕЛКИ:\n" + "\n".join([f"{p.symbol} {'BUY' if p.type==0 else 'SELL'} | Profit: {p.profit:.2f}$" for p in pos])
+    bot.send_message(m.chat.id, res)
+
+@bot.message_handler(func=lambda m: m.text == "📈 Статистика")
+def show_stats(m):
+    if not os.path.exists(LOG_FILE):
+        bot.send_message(m.chat.id, "История сделок пуста.")
+        return
+    df = pd.read_csv(LOG_FILE)
+    closed = df[df['profit'] != "OPEN"].copy()
+    if closed.empty:
+        bot.send_message(m.chat.id, "Нет закрытых сделок для анализа.")
+        return
+    closed['profit'] = pd.to_numeric(closed['profit'])
+    wr = (len(closed[closed['profit'] > 0]) / len(closed)) * 100
+    bot.send_message(m.chat.id, f"📈 **АНАЛИТИКА:**\nСделок: {len(closed)}\nВинрейт: {wr:.1f}%\nПрофит: {closed['profit'].sum():.2f}$", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "⚠️ ЗАКРЫТЬ ВСЕ")
+def close_all(m):
+    for p in mt5.positions_get():
+        tick = mt5.symbol_info_tick(p.symbol)
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": p.symbol, "volume": p.volume,
+            "type": (mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY),
+            "position": p.ticket, "price": (tick.bid if p.type == 0 else tick.ask),
+            "magic": MAGIC, "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        mt5.order_send(req)
+    bot.send_message(m.chat.id, "🛑 Все позиции закрыты.")
+
+# ================= ЗАПУСК =================
+if __name__ == "__main__":
+    Thread(target=trading_engine, daemon=True).start()
+    Thread(target=sync_results_worker, daemon=True).start()
+    print("Бот запущен...")
+    bot.infinity_polling()
