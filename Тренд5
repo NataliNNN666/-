@@ -1,0 +1,185 @@
+import MetaTrader5 as mt5
+import telebot
+import pandas as pd
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import os
+import time
+from datetime import datetime, timedelta
+from threading import Thread
+
+# ================= CONFIG =================
+TOKEN = "ВАШ_ТОКЕН"
+CHAT_ID = "ВАШ_ID"
+ACCOUNT = 68313049
+PASSWORD = "ВАШ_ПАРОЛЬ"
+SERVER = "RoboForex-Pro"
+
+SYMBOLS = {"GOLD": "XAUUSD", "EURUSD": "EURUSD"}
+LOT = 0.01
+MAGIC = 123456
+LOG_FILE = "trading_memory.csv"
+
+# Режим: 0 - Выкл, 1 - Сигналы, 2 - Автоторговля
+trading_mode = 2 
+MODES = {0: "🔴 Отключен", 1: "🔍 Только Сигналы", 2: "🤖 Автоторговля"}
+
+bot = telebot.TeleBot(TOKEN)
+
+# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+
+def get_filling_mode(symbol):
+    """Определяет тип исполнения ордера для брокера"""
+    symbol_info = mt5.symbol_info(symbol)
+    filling_mode = symbol_info.filling_mode
+    if filling_mode & mt5.ORDER_FILLING_IOC:
+        return mt5.ORDER_FILLING_IOC
+    elif filling_mode & mt5.ORDER_FILLING_FOK:
+        return mt5.ORDER_FILLING_FOK
+    return mt5.ORDER_FILLING_RETURN
+
+def log_entry(symbol, side, row, ticket):
+    data = {
+        "ticket": ticket,
+        "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "symbol": symbol,
+        "side": side,
+        "profit": "OPEN"
+    }
+    df = pd.DataFrame([data])
+    df.to_csv(LOG_FILE, mode='a', header=not os.path.exists(LOG_FILE), index=False)
+
+# ================= ВИЗУАЛИЗАЦИЯ =================
+
+def send_chart(symbol, side, price):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 50)
+    if rates is None: return
+    df = pd.DataFrame(rates)
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['close'], label='Цена', color='blue')
+    plt.axhline(y=price, color=('green' if side == "BUY" else 'red'), linestyle='--', label='Вход')
+    plt.title(f"SCALP: {symbol} | {side}")
+    plt.legend()
+    path = f"chart_{symbol}.png"
+    plt.savefig(path)
+    plt.close()
+    with open(path, 'rb') as f:
+        bot.send_photo(CHAT_ID, f, caption=f"🚀 Scalp Order: {side} @ {price}")
+    if os.path.exists(path): os.remove(path)
+
+# ================= ТОРГОВЫЙ ДВИЖОК =================
+
+def open_trade(symbol, side, df_row):
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None: return
+    
+    price = tick.ask if side == "BUY" else tick.bid
+    atr = df_row['ATR']
+    
+    # Скальпинг стопы: 1.5 ATR на SL и 2.0 ATR на TP
+    sl = price - (atr * 1.5) if side == "BUY" else price + (atr * 1.5)
+    tp = price + (atr * 2.0) if side == "BUY" else price - (atr * 2.0)
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": LOT,
+        "type": mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "magic": MAGIC,
+        "comment": "SCALP_V1",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": get_filling_mode(symbol),
+    }
+    
+    result = mt5.order_send(request)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        send_chart(symbol, side, price)
+        log_entry(symbol, side, df_row, result.order)
+    else:
+        print(f"Ошибка ордера {symbol}: {result.comment} (Код: {result.retcode})")
+
+def trading_engine():
+    if not mt5.initialize():
+        print("Ошибка инициализации MT5")
+        return
+    
+    if not mt5.login(ACCOUNT, PASSWORD, SERVER):
+        print("Ошибка авторизации")
+        return
+
+    while True:
+        if trading_mode != 0:
+            try:
+                for _, symbol in SYMBOLS.items():
+                    # Не открываем новую, если уже есть позиция
+                    if mt5.positions_get(symbol=symbol): continue
+                    
+                    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 100)
+                    if rates is None or len(rates) < 30: continue
+                    
+                    df = pd.DataFrame(rates)
+                    
+                    # ИНДИКАТОРЫ
+                    # Bollinger Bands
+                    bb = ta.bbands(df['close'], length=20, std=2)
+                    # Stochastic
+                    stoch = ta.stoch(df['high'], df['low'], df['close'], k=5, d=3)
+                    # ATR для стопов
+                    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                    
+                    df = pd.concat([df, bb, stoch], axis=1).dropna()
+                    
+                    last = df.iloc[-1]
+                    prev = df.iloc[-2]
+                    
+                    # Названия колонок (зависят от pandas_ta)
+                    bbl = last['BBL_20_2.0']
+                    bbu = last['BBU_20_2.0']
+                    stoch_k = last['STOCHk_5_3_3']
+                    prev_stoch_k = prev['STOCHk_5_3_3']
+                    
+                    side = None
+                    
+                    # ЛОГИКА BUY: Цена ниже канала + Стохастик выходит из зоны 20 вверх
+                    if last['close'] < bbl and prev_stoch_k < 20 and stoch_k > 20:
+                        side = "BUY"
+                    
+                    # ЛОГИКА SELL: Цена выше канала + Стохастик выходит из зоны 80 вниз
+                    elif last['close'] > bbu and prev_stoch_k > 80 and stoch_k < 80:
+                        side = "SELL"
+                    
+                    if side:
+                        if trading_mode == 2: open_trade(symbol, side, last)
+                        elif trading_mode == 1:
+                            bot.send_message(CHAT_ID, f"🔍 СИГНАЛ {symbol}: {side}\nStoch: {stoch_k:.2f}")
+                            
+            except Exception as e:
+                print(f"Ошибка цикла: {e}")
+        
+        time.sleep(30) # Проверка каждые 30 секунд
+
+# ================= СТАНДАРТНЫЙ ОБРАБОТЧИК ТЕЛЕГРАМ =================
+# (Код интерфейса Telegram оставляем из вашего примера без изменений)
+
+@bot.message_handler(commands=['start'])
+def welcome(m):
+    bot.send_message(m.chat.id, f"🤖 Скальпер активен\nРежим: {MODES[trading_mode]}", 
+                     reply_markup=get_main_kb())
+
+def get_main_kb():
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📊 Позиции", "💰 Баланс")
+    kb.row("⚙️ Режим", "📈 Статистика")
+    kb.row("⚠️ ЗАКРЫТЬ ВСЕ")
+    return kb
+
+# [Остальные функции Telegram API: balance, positions, close_all и т.д. скопируйте из вашего первого сообщения]
+
+if __name__ == "__main__":
+    # Запуск логики
+    Thread(target=trading_engine, daemon=True).start()
+    print("Скальпинг-бот запущен...")
+    bot.infinity_polling()
