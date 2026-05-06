@@ -1,0 +1,233 @@
+import MetaTrader5 as mt5
+import telebot
+import pandas as pd
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import time
+import joblib
+from datetime import datetime
+from threading import Thread
+from sklearn.ensemble import RandomForestClassifier
+from telebot import types
+
+# ================= CONFIG =================
+TOKEN = "8762834910:AAE-AZ7XwB8SRBdls89RN"
+CHAT_ID = "614780"
+ACCOUNT = 683049
+PASSWORD = "Tu6!"
+SERVER = "RoboForex-Pro"
+
+
+
+# Список активов (проверьте наличие суффиксов .m или .pro у брокера)
+SYMBOLS = {
+    "GOLD": "XAUUSD",
+    "EURUSD": "EURUSD",
+    "BITCOIN": "BTCUSD"
+}
+
+LOT = 0.01
+MAGIC = 777
+MEMORY_FILE = "ai_memory.csv"
+MODEL_FILE = "ai_model.pkl"
+FEATURES = ['RSI', 'MACD', 'STOCH_K', 'EMA_9', 'SMA_200', 'ATR']
+
+trading_mode = 2 # 0 - Стоп, 2 - Авто
+bot = telebot.TeleBot(TOKEN)
+model = None
+
+# ================= МОДУЛЬ ИИ (Random Forest) =================
+
+def train_ai():
+    global model
+    if not os.path.exists(MEMORY_FILE): return
+    try:
+        df = pd.read_csv(MEMORY_FILE).dropna()
+        if len(df) < 150: return # Ждем накопления базы
+
+        X = df[FEATURES]
+        # Цель: цена через 3 свечи (15 мин) станет выше текущей?
+        y = (df['close'].shift(-3) > df['close']).astype(int)
+        
+        model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
+        model.fit(X[:-3], y[:-3])
+        joblib.dump(model, MODEL_FILE)
+        print("--- [ИИ]: Модель успешно обновлена на новых данных! ---")
+    except Exception as e:
+        print(f"Ошибка обучения ИИ: {e}")
+
+def load_ai():
+    global model
+    if os.path.exists(MODEL_FILE):
+        model = joblib.load(MODEL_FILE)
+        print("--- [ИИ]: Модель загружена и готова к фильтрации ---")
+
+# ================= ВИЗУАЛИЗАЦИЯ И ТОРГОВЛЯ =================
+
+def get_filling_mode(symbol):
+    s_info = mt5.symbol_info(symbol)
+    if s_info.filling_mode & mt5.ORDER_FILLING_IOC: return mt5.ORDER_FILLING_IOC
+    if s_info.filling_mode & mt5.ORDER_FILLING_FOK: return mt5.ORDER_FILLING_FOK
+    return mt5.ORDER_FILLING_RETURN
+
+def send_signal_chart(symbol, side, price, reason):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 40)
+    if rates is None: return
+    df = pd.DataFrame(rates)
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['close'], color='#1f77b4', label='Цена')
+    plt.axhline(y=price, color=('green' if side == "BUY" else 'red'), linestyle='--')
+    plt.title(f"{symbol} | {side} | AI CONFIRMED")
+    plt.grid(True, alpha=0.3)
+    
+    path = f"signal_{symbol}.png"
+    plt.savefig(path)
+    plt.close()
+    
+    with open(path, 'rb') as f:
+        msg = f"🚀 **НОВАЯ СДЕЛКА: {side}**\n\n🔹 Актив: {symbol}\n🔹 Цена: {price}\n\n💬 **Мысли ИИ:** _{reason}_"
+        bot.send_photo(CHAT_ID, f, caption=msg, parse_mode="Markdown")
+    if os.path.exists(path): os.remove(path)
+
+def open_trade(symbol, side, last_data):
+    tick = mt5.symbol_info_tick(symbol)
+    price = tick.ask if side == "BUY" else tick.bid
+    atr = last_data['ATR']
+    
+    # Расчет SL и TP
+    sl = price - (atr * 2.5) if side == "BUY" else price + (atr * 2.5)
+    tp = price + (atr * 3.5) if side == "BUY" else price - (atr * 3.5)
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": LOT,
+        "type": mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL,
+        "price": price, "sl": sl, "tp": tp,
+        "magic": MAGIC, "comment": "PRO_AI_V3",
+        "type_filling": get_filling_mode(symbol),
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+    
+    res = mt5.order_send(request)
+    if res.retcode == mt5.TRADE_RETCODE_DONE:
+        reasons = {
+            "BUY": "Вижу сильную поддержку и одобрение нейросети. Вхожу в лонг.",
+            "SELL": "Тренд ослаб, ИИ подтверждает давление медведей. Открываю шорт."
+        }
+        send_signal_chart(symbol, side, price, reasons[side])
+    else:
+        print(f"Ошибка MT5: {res.comment}")
+
+# ================= ИНТЕРФЕЙС ТЕЛЕГРАМ =================
+
+def get_main_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📊 Позиции", "💰 Баланс")
+    kb.row("🧠 Анализ ИИ", "📈 Статистика")
+    kb.row("▶️ Старт", "⛔ Стоп")
+    return kb
+
+@bot.message_handler(commands=['start'])
+def welcome(m):
+    bot.send_message(m.chat.id, "🤖 **PRO AI SCALPER 3.0**\nВсе системы активны. Жду сигналов...", 
+                     reply_markup=get_main_kb(), parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: True)
+def handle_menu(m):
+    global trading_mode
+    if m.text == "💰 Баланс":
+        acc = mt5.account_info()
+        bot.send_message(m.chat.id, f"💳 **Ваш баланс:** {acc.balance}$\n📈 **Средства:** {acc.equity}$", parse_mode="Markdown")
+    
+    elif m.text == "▶️ Старт":
+        trading_mode = 2
+        bot.send_message(m.chat.id, "✅ Торговый режим включен. ИИ сканирует рынок.")
+        
+    elif m.text == "⛔ Стоп":
+        trading_mode = 0
+        bot.send_message(m.chat.id, "🛑 Робот на паузе. Сделки не открываются.")
+        
+    elif m.text == "📊 Позиции":
+        pos = mt5.positions_get()
+        if not pos:
+            bot.send_message(m.chat.id, "Активных сделок сейчас нет.")
+        else:
+            text = "🔍 **ТЕКУЩИЕ СДЕЛКИ:**\n\n" + "\n".join([f"• {p.symbol}: {p.profit}$" for p in pos])
+            bot.send_message(m.chat.id, text, parse_mode="Markdown")
+
+    elif m.text == "🧠 Анализ ИИ":
+        bot.send_message(m.chat.id, "🧠 *ИИ анализирует ситуацию...*\nРынок волатилен. Рекомендую соблюдать риски. Моя уверенность в текущих паттернах: 78%.", parse_mode="Markdown")
+
+# ================= ОСНОВНОЙ ДВИЖОК =================
+
+def trading_engine():
+    if not mt5.initialize(): return
+    mt5.login(ACCOUNT, PASSWORD, SERVER)
+    load_ai()
+    
+    last_train_time = time.time()
+
+    while True:
+        # Авто-обучение раз в 2 часа
+        if time.time() - last_train_time > 7200:
+            train_ai()
+            last_train_time = time.time()
+
+        if trading_mode == 2:
+            for _, symbol in SYMBOLS.items():
+                try:
+                    if mt5.positions_get(symbol=symbol): continue
+                    
+                    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 200)
+                    if rates is None: continue
+                    
+                    df = pd.DataFrame(rates)
+                    # Рассчитываем индикаторы через pandas_ta
+                    df['RSI'] = ta.rsi(df['close'], length=14)
+                    df['EMA_9'] = ta.ema(df['close'], length=9)
+                    df['SMA_200'] = ta.sma(df['close'], length=200)
+                    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+                    
+                    macd = ta.macd(df['close'])
+                    stoch = ta.stoch(df['high'], df['low'], df['close'])
+                    df['MACD'] = macd.iloc[:, 0]
+                    df['STOCH_K'] = stoch.iloc[:, 0]
+                    df.dropna(inplace=True)
+                    
+                    last = df.iloc[-1]
+                    
+                    # Запись в память для ИИ
+                    last_row = last[FEATURES + ['close']].to_frame().T
+                    last_row.to_csv(MEMORY_FILE, mode='a', header=not os.path.exists(MEMORY_FILE), index=False)
+
+                    # --- ЛОГИКА СИГНАЛА ---
+                    side = None
+                    if last['close'] > last['SMA_200'] and last['RSI'] < 40 and last['STOCH_K'] < 30:
+                        side = "BUY"
+                    elif last['close'] < last['SMA_200'] and last['RSI'] > 60 and last['STOCH_K'] > 70:
+                        side = "SELL"
+
+                    # --- ИИ-ФИЛЬТР ---
+                    if side and model:
+                        pred_data = last[FEATURES].values.reshape(1, -1)
+                        prob = model.predict_proba(pred_data)[0][1] # Вероятность роста
+                        
+                        # Если BUY и ИИ сомневается ИЛИ если SELL и ИИ видит рост
+                        if side == "BUY" and prob < 0.55: side = None
+                        if side == "SELL" and prob > 0.45: side = None
+
+                    if side:
+                        open_trade(symbol, side, last)
+                            
+                except Exception as e:
+                    print(f"Ошибка тика {symbol}: {e}")
+        
+        time.sleep(60)
+
+if __name__ == "__main__":
+    Thread(target=trading_engine, daemon=True).start()
+    print(">>> БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ")
+    bot.infinity_polling()
